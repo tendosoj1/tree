@@ -1,95 +1,84 @@
+# review.py v3
+import os, sys, json, urllib.request, urllib.error
 
-# review.py (fixed)
-import os, sys, json
-import urllib.request
-import urllib.error
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+GITHUB_API    = "https://api.github.com"
 
-def get_pr_diff():
-    repo    = os.environ["GITHUB_REPOSITORY"]
-    pr_num  = os.environ["PR_NUMBER"]
-    token   = os.environ["GITHUB_TOKEN"]
-    url     = f"https://api.github.com/repos/{repo}/pulls/{pr_num}/files"
-    req     = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "claude-reviewer"
-    })
-    with urllib.request.urlopen(req) as r:
-        files = json.loads(r.read())
-    patches = []
-    for f in files:
-        patch = f.get("patch", "(binary or no diff)")
-        patches.append(f"### {f['filename']}\n{patch}")
-    return "\n\n".join(patches)
-
-def ask_claude(diff):
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        print("ERROR: ANTHROPIC_API_KEY secret is missing or empty!")
-        sys.exit(1)
-
-    payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 1024,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "You are a senior code reviewer. Review the following "
-                    "PR diff and give clear, constructive feedback.\n\n"
-                    "Focus on: bugs, security issues, ML best practices, "
-                    "performance, and readability.\n\n"
-                    + diff
-                )
-            }
-        ]
-    }
-
-    body = json.dumps(payload).encode("utf-8")
-
+def gh_get(path):
+    token = os.environ["GITHUB_TOKEN"]
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
+        f"{GITHUB_API}{path}",
         headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
             "User-Agent": "claude-reviewer"
-        },
-        method="POST"
+        }
     )
-
-    try:
-        with urllib.request.urlopen(req) as r:
-            data = json.loads(r.read())
-        return data["content"][0]["text"]
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"Claude API error {e.code}: {body}")
-        sys.exit(1)
-
-def post_comment(review):
-    repo   = os.environ["GITHUB_REPOSITORY"]
-    pr_num = os.environ["PR_NUMBER"]
-    token  = os.environ["GITHUB_TOKEN"]
-    url    = f"https://api.github.com/repos/{repo}/issues/{pr_num}/comments"
-    body   = json.dumps({
-        "body": f"## 🤖 Claude Code Review\n\n{review}"
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers={
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "claude-reviewer"
-    }, method="POST")
     with urllib.request.urlopen(req) as r:
-        print(f"Comment posted! Status: {r.status}")
+        return json.loads(r.read().decode())
 
-if __name__ == "__main__":
-    print("Fetching PR diff...")
-    diff = get_pr_diff()
-    print(f"Got diff ({len(diff)} chars). Sending to Claude...")
-    review = ask_claude(diff)
-    print("Got review. Posting comment...")
-    post_comment(review)
-    print("Done!")
+def gh_post(path, data):
+    token = os.environ["GITHUB_TOKEN"]
+    req = urllib.request.Request(
+        f"{GITHUB_API}{path}",
+        data=json.dumps(data).encode(),
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-reviewer"
+        }
+    )
+    with urllib.request.urlopen(req) as r:
+        return r.status
+
+repo   = os.environ["GITHUB_REPOSITORY"]
+pr_num = os.environ["PR_NUMBER"]
+
+print("Fetching PR files...")
+files  = gh_get(f"/repos/{repo}/pulls/{pr_num}/files")
+diff   = "\n\n".join(
+    f"### {f['filename']}\n{f.get('patch','(no diff)')}"
+    for f in files
+)
+print(f"Got {len(files)} file(s).")
+
+print("Calling Claude API...")
+api_key = os.environ["ANTHROPIC_API_KEY"]
+
+payload = json.dumps({
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 1024,
+    "messages": [{
+        "role": "user",
+        "content": f"Review this code diff and give constructive feedback on bugs, style, and improvements:\n\n{diff}"
+    }]
+}).encode()
+
+req = urllib.request.Request(
+    ANTHROPIC_URL,
+    data=payload,
+    method="POST",
+    headers={
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+)
+
+try:
+    with urllib.request.urlopen(req) as r:
+        result = json.loads(r.read().decode())
+    review = result["content"][0]["text"]
+    print("Got Claude review!")
+except urllib.error.HTTPError as e:
+    err = e.read().decode()
+    print(f"Claude API failed: {e.code} - {err}")
+    sys.exit(1)
+
+print("Posting comment to PR...")
+status = gh_post(
+    f"/repos/{repo}/issues/{pr_num}/comments",
+    {"body": f"## 🤖 Claude Code Review\n\n{review}"}
+)
+print(f"Done! GitHub status: {status}")
